@@ -67,7 +67,7 @@ PROXY_SEARCH_V2 = "https://catalog.archives.gov/proxy/records/search"
 CHILD_RECORDS = "https://catalog.archives.gov/proxy/records/parentNaId"
 
 USER_AGENT = (
-    "NARA-Downloader/3.0 "
+    "NARA-Downloader/3.1 "
     "(Document research tool; contact: github.com/nara-downloader)"
 )
 
@@ -99,8 +99,7 @@ def extract_naid(url_or_id: str) -> str:
     for part in reversed(parts):
         if part.isdigit():
             return part
-    logger.error("Could not extract NAID from: %s", url_or_id)
-    sys.exit(1)
+    raise ValueError(f"Could not extract NAID from: {url_or_id}")
 
 
 def sanitize_filename(title: str, max_length: int = 100) -> str:
@@ -185,9 +184,10 @@ class NaraClient:
         self.max_concurrent = max_concurrent
         self.delay = delay
         self._session: aiohttp.ClientSession | None = None
-        self._semaphore = asyncio.Semaphore(max_concurrent)
+        self._semaphore: asyncio.Semaphore | None = None
 
     async def __aenter__(self) -> NaraClient:
+        self._semaphore = asyncio.Semaphore(self.max_concurrent)
         connector = aiohttp.TCPConnector(
             limit=self.max_concurrent,
             limit_per_host=self.max_concurrent,
@@ -204,7 +204,12 @@ class NaraClient:
         )
         return self
 
-    async def __aexit__(self, *exc: Any) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: Any,
+    ) -> None:
         if self._session:
             await self._session.close()
             self._session = None
@@ -308,8 +313,9 @@ class NaraClient:
         pbar: tqdm,
     ) -> tuple[int, str | None]:
         """Download a single file. Returns (index, path) or (index, None)."""
-        async with self._semaphore:
-            for attempt in range(1, MAX_RETRIES + 1):
+        for attempt in range(1, MAX_RETRIES + 1):
+            success = False
+            async with self._semaphore:
                 try:
                     async with self.session.get(url) as resp:
                         if resp.status == 200:
@@ -317,22 +323,22 @@ class NaraClient:
                                 async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
                                     f.write(chunk)
                             pbar.update(1)
-                            if self.delay > 0:
-                                await asyncio.sleep(self.delay)
-                            return (index, dest)
-                        if resp.status == 429:
+                            success = True
+                            # break out of semaphore block before pacing delay
+                        elif resp.status == 429:
                             wait = RETRY_DELAY * attempt * 3
                             pbar.write(f"  Rate-limited on page {index+1}. Waiting {wait}s …")
                             await asyncio.sleep(wait)
                             continue
-                        if resp.status >= 500:
+                        elif resp.status >= 500:
                             await asyncio.sleep(RETRY_DELAY * attempt)
                             continue
-                        pbar.write(
-                            f"  HTTP {resp.status} downloading page {index+1}. "
-                            f"Retry {attempt}/{MAX_RETRIES} …"
-                        )
-                        await asyncio.sleep(RETRY_DELAY)
+                        else:
+                            pbar.write(
+                                f"  HTTP {resp.status} downloading page {index+1}. "
+                                f"Retry {attempt}/{MAX_RETRIES} …"
+                            )
+                            await asyncio.sleep(RETRY_DELAY)
                 except Exception as e:
                     if attempt < MAX_RETRIES:
                         pbar.write(
@@ -342,9 +348,14 @@ class NaraClient:
                         await asyncio.sleep(RETRY_DELAY * attempt)
                     else:
                         pbar.write(f"  [WARN] Failed to download page {index+1}: {e}")
+            # Pacing delay outside semaphore to free the slot for others
+            if success:
+                if self.delay > 0:
+                    await asyncio.sleep(self.delay)
+                return (index, dest)
 
-            pbar.update(1)
-            return (index, None)
+        pbar.update(1)
+        return (index, None)
 
     async def download_pages(
         self,
@@ -375,7 +386,8 @@ class NaraClient:
                 continue
 
             page_num = obj.get("pageNum", i + 1)
-            ext = Path(object_url).suffix.lower() or ".jpg"
+            parsed_path = urlparse(object_url).path
+            ext = Path(parsed_path).suffix.lower() or ".jpg"
             local_path = os.path.join(tmp_dir, f"page_{page_num:05d}{ext}")
 
             task = asyncio.create_task(
@@ -395,32 +407,35 @@ class NaraClient:
 
 
 # ---------------------------------------------------------------------------
-# PDF pipeline: prepare → compile
+# PDF pipeline: prepare → compile (order-preserving)
 # ---------------------------------------------------------------------------
-def prepare_images(image_paths: list[str]) -> tuple[list[str], list[str]]:
+def prepare_images(
+    image_paths: list[str],
+) -> list[tuple[str, str]]:
     """
-    Normalize downloaded files into two clean lists:
-    - image_files: paths suitable for img2pdf (JPEG, PNG, TIFF)
-    - pdf_files: existing PDF pages that need pikepdf merging
+    Normalize downloaded files into an ordered list of (kind, path) tuples.
+
+    Each entry is either ("image", path) for img2pdf-compatible files,
+    or ("pdf", path) for existing PDF pages. Original page order is
+    preserved so that mixed image/PDF inputs are assembled correctly.
 
     Unknown formats are converted to JPEG. Invalid files are skipped.
     """
-    image_files: list[str] = []
-    pdf_files: list[str] = []
+    prepared: list[tuple[str, str]] = []
 
     for path in image_paths:
         ext = Path(path).suffix.lower()
         if ext == ".pdf":
-            pdf_files.append(path)
+            prepared.append(("pdf", path))
         elif ext in IMG2PDF_EXTENSIONS:
-            image_files.append(path)
-        elif ext == ".gif":
-            # Convert GIF to JPEG (img2pdf doesn't handle GIF)
+            prepared.append(("image", path))
+        elif ext in (".gif", ""):
+            # Convert GIF / unknown to JPEG (img2pdf doesn't handle GIF)
             converted = path + ".jpg"
             try:
                 img = Image.open(path)
                 img.convert("RGB").save(converted, "JPEG", quality=95)
-                image_files.append(converted)
+                prepared.append(("image", converted))
                 img.close()
             except Exception as e:
                 logger.warning("Could not convert %s: %s", path, e)
@@ -430,36 +445,38 @@ def prepare_images(image_paths: list[str]) -> tuple[list[str], list[str]]:
             try:
                 img = Image.open(path)
                 img.convert("RGB").save(converted, "JPEG", quality=95)
-                image_files.append(converted)
+                prepared.append(("image", converted))
                 img.close()
             except Exception as e:
                 logger.warning("Could not process %s: %s", path, e)
 
-    return image_files, pdf_files
+    return prepared
 
 
 def compile_pdf(
-    image_files: list[str],
-    pdf_files: list[str],
+    prepared_pages: list[tuple[str, str]],
     output_path: str,
 ) -> str:
     """
-    Assemble prepared image and PDF files into a single output PDF.
+    Assemble prepared pages into a single output PDF, preserving order.
 
     Strategy:
       1. Images only → img2pdf (lossless, fast, near-zero memory)
-      2. Mixed images + PDFs → img2pdf for images, pikepdf to merge all
+      2. Mixed images + PDFs → process runs of consecutive images via
+         img2pdf, then merge all segments via pikepdf in original order
       3. Fallback → chunked Pillow if img2pdf fails
     """
-    total = len(image_files) + len(pdf_files)
-    if total == 0:
+    if not prepared_pages:
         logger.error("No valid files to combine.")
         return ""
 
-    logger.info("Combining %d page(s) into PDF …", total)
+    logger.info("Combining %d page(s) into PDF …", len(prepared_pages))
+
+    has_pdfs = any(kind == "pdf" for kind, _ in prepared_pages)
+    image_files = [p for kind, p in prepared_pages if kind == "image"]
 
     # Pure-image fast path
-    if not pdf_files:
+    if not has_pdfs:
         try:
             with open(output_path, "wb") as f:
                 f.write(img2pdf.convert(image_files))
@@ -469,8 +486,8 @@ def compile_pdf(
             logger.warning("img2pdf failed: %s — falling back to chunked Pillow", e)
             return _pillow_chunked_to_pdf(image_files, output_path)
 
-    # Mixed path: images + existing PDFs → merge via pikepdf
-    return _merge_mixed_to_pdf(image_files, pdf_files, output_path)
+    # Mixed path: preserve original order using runs
+    return _merge_ordered_to_pdf(prepared_pages, output_path)
 
 
 def _log_pdf_size(path: str) -> None:
@@ -563,53 +580,84 @@ def _pillow_single_chunk_to_pdf(image_paths: list[str], output_path: str) -> str
     return output_path
 
 
-def _merge_mixed_to_pdf(
-    image_files: list[str],
-    pdf_files: list[str],
+def _merge_ordered_to_pdf(
+    prepared_pages: list[tuple[str, str]],
     output_path: str,
 ) -> str:
-    """Merge images and existing PDFs into one output PDF via pikepdf."""
+    """Merge images and PDFs into one output PDF preserving original page order.
+
+    Groups consecutive images into runs, converts each run to a temp PDF
+    via img2pdf, then merges all segments (image-run PDFs and existing PDFs)
+    in the original order via pikepdf.
+    """
     try:
         import pikepdf
     except ImportError:
-        logger.warning("pikepdf not installed — skipping embedded PDF pages. Install with: pip install pikepdf")
+        logger.warning(
+            "pikepdf not installed — skipping embedded PDF pages. "
+            "Install with: pip install pikepdf"
+        )
+        image_files = [p for kind, p in prepared_pages if kind == "image"]
         if image_files:
-            return compile_pdf(image_files, [], output_path)
+            return compile_pdf(
+                [("image", f) for f in image_files], output_path
+            )
         return ""
 
-    temp_pdfs: list[str] = []
+    # Build ordered list of PDF segments: each is a path to merge
+    segments: list[str] = []
+    temp_files: list[str] = []
+    current_image_run: list[str] = []
+    run_counter = 0
 
-    if image_files:
-        images_pdf = output_path + ".tmp_images.pdf"
+    def _flush_image_run() -> None:
+        nonlocal run_counter
+        if not current_image_run:
+            return
+        run_pdf = f"{output_path}.tmp_run_{run_counter:04d}.pdf"
+        run_counter += 1
         try:
-            with open(images_pdf, "wb") as f:
-                f.write(img2pdf.convert(image_files))
-            temp_pdfs.append(images_pdf)
+            with open(run_pdf, "wb") as f:
+                f.write(img2pdf.convert(current_image_run))
+            segments.append(run_pdf)
+            temp_files.append(run_pdf)
         except Exception as e:
-            logger.warning("img2pdf failed for images: %s", e)
-            images_pdf_fallback = output_path + ".tmp_images_fb.pdf"
-            result = _pillow_chunked_to_pdf(image_files, images_pdf_fallback)
+            logger.warning("img2pdf failed for image run: %s", e)
+            fallback_pdf = f"{output_path}.tmp_run_{run_counter:04d}_fb.pdf"
+            result = _pillow_chunked_to_pdf(current_image_run, fallback_pdf)
             if result:
-                temp_pdfs.append(result)
+                segments.append(result)
+                temp_files.append(result)
+        current_image_run.clear()
 
-    temp_pdfs.extend(pdf_files)
+    for kind, path in prepared_pages:
+        if kind == "image":
+            current_image_run.append(path)
+        else:
+            # Flush any pending image run before this PDF
+            _flush_image_run()
+            segments.append(path)
 
+    # Flush any trailing image run
+    _flush_image_run()
+
+    # Merge all segments in order
     merged = pikepdf.Pdf.new()
-    for pdf_path in temp_pdfs:
+    for seg_path in segments:
         try:
-            src = pikepdf.open(pdf_path)
+            src = pikepdf.open(seg_path)
             merged.pages.extend(src.pages)
         except Exception as e:
-            logger.warning("Could not merge %s: %s", pdf_path, e)
+            logger.warning("Could not merge %s: %s", seg_path, e)
     merged.save(output_path)
     merged.close()
 
-    for path in temp_pdfs:
-        if ".tmp_" in path:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
+    # Clean up temp files
+    for path in temp_files:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
     _log_pdf_size(output_path)
     return output_path
@@ -655,10 +703,10 @@ def add_ocr_layer(input_pdf: str, output_pdf: str, lang: str = "eng") -> str:
 
         logger.info("Using pytesseract fallback (text extraction only) …")
         full_text: list[str] = []
-        pdf_images = _pdf_to_images(input_pdf)
-        for i, img in enumerate(tqdm(pdf_images, desc="OCR processing", unit="page")):
+        for i, img in enumerate(tqdm(_pdf_to_images(input_pdf), desc="OCR processing", unit="page")):
             text = pytesseract.image_to_string(img, lang=lang)
             full_text.append(f"--- Page {i+1} ---\n{text}")
+            img.close()
 
         text_path = input_pdf.replace(".pdf", "_ocr_text.txt")
         with open(text_path, "w", encoding="utf-8") as f:
@@ -677,14 +725,34 @@ def add_ocr_layer(input_pdf: str, output_pdf: str, lang: str = "eng") -> str:
         return input_pdf
 
 
-def _pdf_to_images(pdf_path: str) -> list[Image.Image]:
-    """Convert PDF pages to PIL Images for OCR processing."""
+def _pdf_to_images(pdf_path: str):
+    """Yield PDF pages one at a time as PIL Images for OCR processing.
+
+    Streams page-by-page to avoid loading the entire document into RAM.
+    A 1,000-page document at 300 DPI would consume ~20-30 GB if loaded
+    at once; this generator keeps memory usage bounded to one page.
+    """
     try:
         from pdf2image import convert_from_path
-        return convert_from_path(pdf_path, dpi=300)
+        from pdf2image.pdf2image import pdfinfo_from_path
     except ImportError:
         logger.warning("pdf2image not installed — cannot convert PDF to images for OCR")
-        return []
+        return
+
+    try:
+        info = pdfinfo_from_path(pdf_path)
+        max_pages = info["Pages"]
+    except Exception as e:
+        logger.warning("Could not read PDF info: %s — falling back to full load", e)
+        yield from convert_from_path(pdf_path, dpi=300)
+        return
+
+    for page_num in range(1, max_pages + 1):
+        images = convert_from_path(
+            pdf_path, dpi=300, first_page=page_num, last_page=page_num
+        )
+        if images:
+            yield images[0]
 
 
 # ---------------------------------------------------------------------------
@@ -725,7 +793,7 @@ async def async_main(args: argparse.Namespace) -> None:
     """Async entry point — runs the full download pipeline."""
     naid = extract_naid(args.target)
     logger.info("=" * 60)
-    logger.info(" NARA Catalog Document Downloader v3.0")
+    logger.info(" NARA Catalog Document Downloader v3.1")
     logger.info(" NAID: %s", naid)
     logger.info(" URL:  https://catalog.archives.gov/id/%s", naid)
     if _UVLOOP:
@@ -739,7 +807,7 @@ async def async_main(args: argparse.Namespace) -> None:
         # Fetch record
         record = await client.fetch_record(naid)
         if not record:
-            sys.exit(1)
+            raise RuntimeError(f"No record found for NAID {naid}")
 
         title = record.get("title", f"NAID_{naid}")
         level = record.get("levelOfDescription", "unknown")
@@ -784,12 +852,11 @@ async def async_main(args: argparse.Namespace) -> None:
                                 naid = child_naid_str
 
         if not objects:
-            logger.error(
-                "No downloadable digital objects found for this record.\n"
+            raise RuntimeError(
+                "No downloadable digital objects found for this record. "
                 "The record may not have been digitized, or may use a "
                 "different format (e.g. electronic records/data files)."
             )
-            sys.exit(1)
 
         # Extract existing NARA OCR text if requested
         if args.extract_text:
@@ -813,8 +880,7 @@ async def async_main(args: argparse.Namespace) -> None:
             downloaded = await client.download_pages(objects, tmp_dir)
 
             if not downloaded:
-                logger.error("No pages were downloaded successfully.")
-                sys.exit(1)
+                raise RuntimeError("No pages were downloaded successfully.")
 
             logger.info(
                 "\nSuccessfully downloaded %d/%d page(s).",
@@ -836,10 +902,10 @@ async def async_main(args: argparse.Namespace) -> None:
                 output_name += ".pdf"
             output_path = os.path.join(args.output_dir, output_name)
 
-            image_files, pdf_files = prepare_images(downloaded)
-            pdf_path = compile_pdf(image_files, pdf_files, output_path)
+            prepared_pages = prepare_images(downloaded)
+            pdf_path = compile_pdf(prepared_pages, output_path)
             if not pdf_path:
-                sys.exit(1)
+                raise RuntimeError("PDF compilation failed — no valid files to combine.")
 
             # OCR
             if args.ocr:
@@ -889,7 +955,14 @@ Examples:
 
     args = parser.parse_args()
     _configure_logging(verbose=args.verbose, quiet=args.quiet)
-    asyncio.run(async_main(args))
+    try:
+        asyncio.run(async_main(args))
+    except (ValueError, RuntimeError) as e:
+        logger.error("%s", e)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        logger.info("\nInterrupted.")
+        sys.exit(130)
 
 
 if __name__ == "__main__":

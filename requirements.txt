@@ -1,4 +1,8 @@
+# Core dependencies (required)
 aiohttp>=3.9.0
 Pillow>=10.0.0
 img2pdf>=0.5.1
 tqdm>=4.66.0
+
+# PDF merging for mixed image/PDF inputs
+pikepdf>=8.0.0

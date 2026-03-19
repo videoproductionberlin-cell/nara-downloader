@@ -56,7 +56,7 @@ brew install tesseract tesseract-lang ocrmypdf ghostscript poppler
 
 # Install Python dependencies
 pip install -r requirements.txt
-pip install ocrmypdf pikepdf pdf2image pytesseract uvloop
+pip install -r requirements-optional.txt  # OCR + uvloop
 
 # Run
 python nara_download.py 1667751 --ocr --concurrent 30
@@ -71,7 +71,7 @@ sudo apt-get install tesseract-ocr tesseract-ocr-eng tesseract-ocr-deu \
 
 # Install Python dependencies
 pip install -r requirements.txt
-pip install ocrmypdf pikepdf pdf2image pytesseract uvloop
+pip install -r requirements-optional.txt  # OCR + uvloop
 
 # Run
 python nara_download.py https://catalog.archives.gov/id/1667751
@@ -150,8 +150,8 @@ async def download_document(naid: str, output_dir: str = "."):
         objects = get_digital_objects(record)
         paths = await client.download_pages(objects, output_dir)
 
-        image_files, pdf_files = prepare_images(paths)
-        compile_pdf(image_files, pdf_files, f"{output_dir}/output.pdf")
+        prepared = prepare_images(paths)
+        compile_pdf(prepared, f"{output_dir}/output.pdf")
 
 asyncio.run(download_document("595500", "/tmp/nara"))
 ```
@@ -226,11 +226,10 @@ The tool uses a semaphore to cap concurrent connections (default 20) and adds a 
 ## Requirements
 
 - Python 3.9+
-- `aiohttp` for all network I/O
-- For OCR: Tesseract, ocrmypdf
-- For mixed PDF merging: pikepdf
+- Core: `aiohttp`, `Pillow`, `img2pdf`, `tqdm`, `pikepdf` (see `requirements.txt`)
+- OCR: `ocrmypdf`, `pytesseract`, `pdf2image`, plus Tesseract system package
 - Optional: `uvloop` for faster async on macOS/Linux
-- See `requirements.txt` for Python packages
+- See `requirements-optional.txt` for OCR and performance extras
 
 ## License
 

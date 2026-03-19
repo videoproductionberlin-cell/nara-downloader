@@ -20,10 +20,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Install Python dependencies
-COPY requirements.txt .
+# Install Python dependencies (core + optional)
+COPY requirements.txt requirements-optional.txt ./
 RUN pip install --no-cache-dir -r requirements.txt \
-    && pip install --no-cache-dir ocrmypdf pikepdf pdf2image pytesseract uvloop
+    && pip install --no-cache-dir -r requirements-optional.txt
 
 COPY nara_download.py .
 
