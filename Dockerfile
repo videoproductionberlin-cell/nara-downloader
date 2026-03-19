@@ -1,3 +1,4 @@
+# Build natively on Apple Silicon: docker build --platform linux/arm64 -t nara-downloader .
 FROM python:3.12-slim
 
 # Install system dependencies for OCR
@@ -22,7 +23,7 @@ WORKDIR /app
 # Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
-    && pip install --no-cache-dir ocrmypdf pikepdf pdf2image pytesseract
+    && pip install --no-cache-dir ocrmypdf pikepdf pdf2image pytesseract uvloop
 
 COPY nara_download.py .
 
