@@ -2,7 +2,7 @@
 
 Downloads complete multi-page documents from the [National Archives Catalog](https://catalog.archives.gov/) and combines them into a single PDF — with optional OCR to make scanned documents searchable.
 
-Optimized for large documents (1,000+ pages) with async I/O, lossless PDF creation, and memory-safe processing.
+Optimized for large documents (1,000+ pages) with fully async I/O, lossless PDF creation, and memory-safe processing.
 
 ## The Problem
 
@@ -11,13 +11,15 @@ Many documents on catalog.archives.gov can only be viewed page-by-page in the br
 ## Features
 
 - Downloads **all pages** of a document automatically
-- **Async I/O** via `aiohttp` — handles 20+ concurrent connections with minimal overhead
+- **Fully async** — single `aiohttp` network stack, no threads, no GIL contention
 - Optional **uvloop** for even faster async performance on macOS/Linux
 - Combines pages into a **single PDF** using lossless `img2pdf` (no re-encoding, near-zero memory)
 - **Chunked fallback** — if `img2pdf` can't handle a format, Pillow processes in 50-page batches to prevent OOM
 - Optional **OCR** with Tesseract (adds a searchable text layer)
 - Supports **multiple OCR languages** (English, German, etc.)
 - Extracts **existing NARA OCR text** if available
+- Proper `logging` module — control output with `--verbose` / `--quiet`
+- **Importable as a library** — `NaraClient` class with async context manager
 - Polite rate-limiting and retry logic with exponential backoff
 - Works with NARA Catalog URLs or plain NAID numbers
 
@@ -93,6 +95,8 @@ Options:
   --extract-text         Save NARA's existing OCR text to a .txt file
   --delay SECONDS        Delay between downloads in seconds (default: 0.1)
   --concurrent N         Max concurrent downloads (default: 20)
+  -v, --verbose          Show debug output
+  -q, --quiet            Only show warnings and errors
 ```
 
 ## Examples
@@ -124,6 +128,32 @@ python nara_download.py 1667751 --images-only --output-dir ./pages/
 
 # Max throughput for a huge document
 python nara_download.py 1667751 --concurrent 50 --delay 0.05
+
+# Quiet mode (only warnings and errors)
+python nara_download.py 1667751 -q
+
+# Debug mode (verbose output)
+python nara_download.py 1667751 -v
+```
+
+## Library Usage
+
+The downloader can be imported and used programmatically:
+
+```python
+import asyncio
+from nara_download import NaraClient, get_digital_objects, prepare_images, compile_pdf
+
+async def download_document(naid: str, output_dir: str = "."):
+    async with NaraClient(max_concurrent=30) as client:
+        record = await client.fetch_record(naid)
+        objects = get_digital_objects(record)
+        paths = await client.download_pages(objects, output_dir)
+
+        image_files, pdf_files = prepare_images(paths)
+        compile_pdf(image_files, pdf_files, f"{output_dir}/output.pdf")
+
+asyncio.run(download_document("595500", "/tmp/nara"))
 ```
 
 ## How It Works
@@ -132,16 +162,17 @@ python nara_download.py 1667751 --concurrent 50 --delay 0.05
 2. Queries the NARA Catalog API (proxy endpoints) to get record metadata
 3. Extracts all digital object (page) URLs from the record
 4. Downloads pages concurrently via async I/O (`aiohttp` + semaphore-based throttling)
-5. Combines all pages into a single PDF using `img2pdf` (lossless, memory-efficient)
-6. Optionally adds a searchable OCR text layer using ocrmypdf/Tesseract
+5. Normalizes all files via `prepare_images()` (separates images from PDFs, converts unsupported formats)
+6. Assembles the final PDF via `compile_pdf()` using `img2pdf` (lossless, memory-efficient)
+7. Optionally adds a searchable OCR text layer using ocrmypdf/Tesseract
 
 ## Performance
 
 ### Download speed
 
-The download engine uses `aiohttp` with `asyncio` instead of threads. A semaphore controls concurrency — you can safely set `--concurrent 50` without spawning 50 OS threads or fighting the GIL. If `uvloop` is installed, it replaces Python's default event loop with a Cython-based implementation for additional throughput.
+The entire network stack is async — metadata fetching and image downloads all run through a single `aiohttp.ClientSession`. A semaphore controls concurrency without OS threads or GIL contention. If `uvloop` is installed, it replaces Python's default event loop for additional throughput.
 
-| Pages | Threads (v1) | Async (v2)       |
+| Pages | Threads (v1) | Async (v2+)      |
 |-------|-------------|------------------|
 | 100   | ~45s        | ~12s             |
 | 500   | ~4 min      | ~50s             |
@@ -195,7 +226,7 @@ The tool uses a semaphore to cap concurrent connections (default 20) and adds a 
 ## Requirements
 
 - Python 3.9+
-- `aiohttp` for async downloads
+- `aiohttp` for all network I/O
 - For OCR: Tesseract, ocrmypdf
 - For mixed PDF merging: pikepdf
 - Optional: `uvloop` for faster async on macOS/Linux
